@@ -36,22 +36,39 @@ def center_crop_arr(pil_image, image_size):
 
 
 class LMDBImageNetReader(torch.utils.data.Dataset):
+    """LMDB reader with lazy initialization for fork-safety with DataLoader workers."""
+    
     def __init__(self, lmdb_path, transform=None):
-        self.env = lmdb.open(lmdb_path, 
+        self.lmdb_path = lmdb_path
+        self.transform = transform
+        self.env = None  # Lazy initialization for fork-safety
+        
+        # Get length by temporarily opening the DB (will be closed before forking)
+        temp_env = lmdb.open(lmdb_path, 
                             readonly=True,
                             lock=False,
                             readahead=False,
                             meminit=False)
-        
-        with self.env.begin() as txn:
+        with temp_env.begin() as txn:
             self.length = int(txn.get('num_samples'.encode()).decode())
-        
-        self.transform = transform
+        temp_env.close()
+    
+    def _init_db(self):
+        """Initialize LMDB environment (called lazily in worker process)."""
+        if self.env is None:
+            self.env = lmdb.open(self.lmdb_path, 
+                                readonly=True,
+                                lock=False,
+                                readahead=False,
+                                meminit=False)
     
     def __len__(self):
         return self.length
     
     def __getitem__(self, index):
+        # Lazy init: open LMDB in worker process, not parent
+        self._init_db()
+        
         with self.env.begin() as txn:
             data = txn.get(f'{index}'.encode())
             if data is None:
@@ -73,11 +90,11 @@ class LMDBImageNetReader(torch.utils.data.Dataset):
             return img, label, filename, index 
     
     def __del__(self):
-        if hasattr(self, 'env') and self.env is not None:
+        if self.env is not None:
             try:
                 self.env.close()
-            except Exception as e:
-                print(f"Error closing LMDB environment: {e}")
+            except Exception:
+                pass  # Ignore errors during cleanup
 
 def process_batch(args, vae, device, images, labels, filenames, original_indices, env):
     images = images.to(device)
@@ -145,15 +162,19 @@ def preprocess_latents(args):
         pin_memory=True
     )
     
-    os.makedirs(os.path.dirname(args.target_lmdb) if os.path.dirname(args.target_lmdb) else '.', exist_ok=True)
+    # Each rank writes to its own LMDB file to avoid concurrent write conflicts
+    target_lmdb_rank = f"{args.target_lmdb}_rank{rank}"
+    os.makedirs(os.path.dirname(target_lmdb_rank) if os.path.dirname(target_lmdb_rank) else '.', exist_ok=True)
     
-    map_size = 1024 * 1024 * 1024 * args.lmdb_size_gb
+    # Divide map size by world_size since each rank only writes its shard
+    map_size = 1024 * 1024 * 1024 * args.lmdb_size_gb // world_size
     if rank == 0:
-        print(f"Creating target LMDB at {args.target_lmdb} with size {args.lmdb_size_gb}GB")
+        print(f"Each rank writing to separate LMDB: {args.target_lmdb}_rank<N>")
+        print(f"Per-rank LMDB size: {args.lmdb_size_gb // world_size}GB")
     
     env = None
     try:
-        env = lmdb.open(args.target_lmdb, map_size=map_size, max_readers=world_size*2, max_spare_txns=world_size*2)
+        env = lmdb.open(target_lmdb_rank, map_size=map_size)
         
         total_processed = 0
         start_time = time.time()
@@ -174,15 +195,16 @@ def preprocess_latents(args):
         if pbar is not None:
             pbar.close()
         
-        dist.barrier()
-        
-        if rank == 0:
-            try:
-                with env.begin(write=True) as txn:
-                    txn.put('num_samples'.encode(), str(len(dataset)).encode())
-                    txn.put('created_at'.encode(), str(datetime.datetime.now()).encode())
-            except lmdb.Error as e:
-                print(f"Error writing metadata: {e}")
+        # Each rank writes its own metadata
+        try:
+            with env.begin(write=True) as txn:
+                txn.put('num_samples'.encode(), str(total_processed).encode())
+                txn.put('total_dataset_size'.encode(), str(len(dataset)).encode())
+                txn.put('rank'.encode(), str(rank).encode())
+                txn.put('world_size'.encode(), str(world_size).encode())
+                txn.put('created_at'.encode(), str(datetime.datetime.now()).encode())
+        except lmdb.Error as e:
+            print(f"Rank {rank} error writing metadata: {e}")
         
         dist.barrier()
         
@@ -191,7 +213,7 @@ def preprocess_latents(args):
         if rank == 0:
             print(f'Preprocessing completed in {total_time_str}')
             print(f'Each process processed approximately {total_processed} samples')
-            print(f'Target LMDB saved at: {args.target_lmdb}')
+            print(f'Target LMDBs saved at: {args.target_lmdb}_rank0 through {args.target_lmdb}_rank{world_size-1}')
     
     except Exception as e:
         print(f"Process {rank} encountered error: {e}")
