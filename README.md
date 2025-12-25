@@ -43,20 +43,37 @@ pip install -r requirements.txt
 
 **Preparing Data**
 
-This implementation utilizes LMDB datasets with VAE-encoded latent representations for efficient training. The preprocessing pipeline is adapted from the [MAR](https://github.com/LTH14/mar/blob/main/main_cache.py).
+This implementation requires [ImageNet ILSVRC2012](https://image-net.org/challenges/LSVRC/2012/) (1000 classes). The preprocessing converts images to VAE-encoded latents in LMDB format.
 
+Expected directory structure:
+```
+ImageNet/
+└── train/
+    ├── n01440764/
+    │   ├── n01440764_10026.JPEG
+    │   └── ...
+    ├── n01443537/
+    └── ... (1000 class folders)
+```
+
+**Step 1:** Convert ImageNet to LMDB format using `preprocess_imagenet/image2lmdb.py`:
 ```bash
-# Example dataset preparation for ImageNet
+# Edit the paths in image2lmdb.py, then run:
+cd ./preprocess_imagenet
+python image2lmdb.py
+```
+
+**Step 2:** Encode images to VAE latents:
+```bash
 cd ./preprocess_imagenet
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     main_cache.py \
-    --source_lmdb /data/ImageNet_train \
-    --target_lmdb /data/train_vae_latents_lmdb \
+    --source_lmdb /path/to/imagenet_train.lmdb \
+    --target_lmdb /path/to/train_vae_latents_lmdb \
     --img_size 256 \
     --batch_size 1024 \
     --lmdb_size_gb 400
 ```
-*Note: The preprocessing assumes ImageNet has been pre-converted to LMDB format.*
 
 **Training**
 
